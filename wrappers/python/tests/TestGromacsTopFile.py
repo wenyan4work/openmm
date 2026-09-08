@@ -1,4 +1,7 @@
 import unittest
+import os
+import tempfile
+from unittest.mock import patch
 from validateConstraints import *
 from openmm.app import *
 from openmm import *
@@ -8,6 +11,132 @@ import openmm.app.element as elem
 from numpy.testing import assert_allclose
 
 GROMACS_INCLUDE = _defaultGromacsIncludeDir()
+
+class TestGromacsTopParser(unittest.TestCase):
+    """Parser regressions that do not require a GROMACS installation."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def writeFile(self, name, content):
+        path = os.path.join(self.directory.name, name)
+        with open(path, 'w') as output:
+            output.write(content)
+        return path
+
+    def topologyText(self, atomtype, atomName='CA'):
+        return ('[ defaults ]\n1 2 yes 1 1\n[ atomtypes ]\n'+atomtype+
+                '\n[ moleculetype ]\nMOL 3\n[ atoms ]\n1 T 1 MOL '+atomName+
+                ' 1\n[ molecules ]\nMOL 1\n')
+
+    def loadTopology(self, atomtype, atomName='CA', **kwargs):
+        path = self.writeFile('test.top', self.topologyText(atomtype, atomName))
+        return GromacsTopFile(path, **kwargs)
+
+    def testAtomicNumberOverridesName(self):
+        for number, expected in [(1, elem.hydrogen), (6, elem.carbon),
+                                 (17, elem.chlorine), (20, elem.calcium)]:
+            for bonded in ('', 'BT '):
+                with self.subTest(number=number, bonded=bonded):
+                    top = self.loadTopology('T '+bonded+str(number)+' 1 0 A 0.3 0.2')
+                    self.assertEqual(next(top.topology.atoms()).element, expected)
+                    self.assertEqual(top.createSystem().getParticleMass(0), 1*dalton)
+
+    def testStrictAtomicNumber(self):
+        for bonded in ('', 'BT '):
+            top = self.loadTopology('T '+bonded+'20 40.08 0 A 0.3 0.2',
+                                    allowElementGuessing=False)
+            self.assertEqual(next(top.topology.atoms()).element, elem.calcium)
+
+    def testMissingAtomicNumber(self):
+        for bonded in ('', 'BT ', '2C ', '_C '):
+            with self.subTest(bonded=bonded):
+                atomtype = 'T '+bonded+'12.01 0 A 0.3 0.2'
+                top = self.loadTopology(atomtype)
+                self.assertEqual(next(top.topology.atoms()).element, elem.carbon)
+                self.assertEqual(top.createSystem().getParticleMass(0), 12.01*dalton)
+                with self.assertRaisesRegex(ValueError, 'atomic number.*T'):
+                    self.loadTopology(atomtype, allowElementGuessing=False)
+
+    def testGuessingCompatibility(self):
+        for name, expected in [('CA', elem.carbon), ('CL', elem.chlorine),
+                               ('NA', elem.sodium), ('MG', elem.magnesium), ('XX', None)]:
+            with self.subTest(name=name):
+                top = self.loadTopology('T 12.01 0 A 0.3 0.2', name,
+                                        allowElementGuessing=True)
+                self.assertEqual(next(top.topology.atoms()).element, expected)
+
+    def testExplicitZeroHasNoElement(self):
+        for number in ('0', '00', '+0'):
+            for guess in (True, False):
+                with self.subTest(number=number, guess=guess):
+                    top = self.loadTopology('T BT '+number+' 0 0 A 0 0', 'H',
+                                            allowElementGuessing=guess)
+                    self.assertIsNone(next(top.topology.atoms()).element)
+
+    def testInvalidAtomicNumber(self):
+        for number in ('-1', '999', '6.5', 'bad'):
+            for guess in (True, False):
+                with self.subTest(number=number, guess=guess):
+                    with self.assertRaisesRegex(ValueError, 'atomic number.*T'):
+                        self.loadTopology('T BT '+number+' 12.01 0 A 0.3 0.2',
+                                          allowElementGuessing=guess)
+
+    def testUnknownAtomType(self):
+        with self.assertRaisesRegex(ValueError, 'Unknown atom type: T'):
+            self.loadTopology('OTHER 6 12.01 0 A 0.3 0.2')
+
+    def testStrictModeIgnoresUnusedTypes(self):
+        top = self.loadTopology('UNUSED 12.01 0 A 0.3 0.2\nT 6 12.01 0 A 0.3 0.2',
+                                allowElementGuessing=False)
+        self.assertEqual(next(top.topology.atoms()).element, elem.carbon)
+
+    def testFilesClosed(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                self.writeFile('child.itp', '[ invalid' if fails else
+                               self.topologyText('T 6 12.01 0 A 0.3 0.2'))
+                path = self.writeFile('parent.top', '#include "child.itp"\n')
+                opened = []
+                realOpen = open
+                def trackingOpen(*args, **kwargs):
+                    handle = realOpen(*args, **kwargs)
+                    opened.append(handle)
+                    return handle
+                with patch('openmm.app.gromacstopfile.open', trackingOpen):
+                    if fails:
+                        with self.assertRaises(ValueError):
+                            GromacsTopFile(path)
+                    else:
+                        GromacsTopFile(path)
+                self.assertEqual(len(opened), 2)
+                self.assertTrue(all(handle.closed for handle in opened))
+
+    def testMalformedSections(self):
+        cases = [('moleculetype', 'MOL', 'Too few fields'),
+                 ('dihedraltypes', 'A B', 'Too few fields'),
+                 ('virtual_sites2', '1 2 3 1 0.5', 'before'),
+                 ('virtual_sites3', '1 2 3 4 1 0.2 0.3', 'before')]
+        for section, record, message in cases:
+            with self.subTest(section=section):
+                path = self.writeFile('test.top', '[ '+section+' ]\n'+record+'\n')
+                with self.assertRaisesRegex(ValueError, message):
+                    GromacsTopFile(path)
+
+    def testIndentedDefine(self):
+        path = self.writeFile('test.top', '   #define MASS 12.01\n'+
+                              self.topologyText('T 6 MASS 0 A 0.3 0.2'))
+        top = GromacsTopFile(path)
+        self.assertEqual(top.createSystem().getParticleMass(0), 12.01*dalton)
+
+    def testIgnoredUndef(self):
+        path = self.writeFile('test.top', '#define MASS 12.01\n#ifdef UNDEFINED\n'
+                              '#undef MASS\n#endif\n'+
+                              self.topologyText('T 6 MASS 0 A 0.3 0.2'))
+        top = GromacsTopFile(path)
+        self.assertEqual(top.createSystem().getParticleMass(0), 12.01*dalton)
+
 
 @unittest.skipIf(not os.path.exists(GROMACS_INCLUDE), 'GROMACS is not installed')
 class TestGromacsTopFile(unittest.TestCase):

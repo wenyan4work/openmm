@@ -325,6 +325,15 @@ Unix-like operating systems.  So in :autonumref:`Example,Gromacs example` we act
 this parameter, but if the Gromacs files were installed in any other location,
 we would need to include it.
 
+By default, OpenMM uses the atomic numbers in the :code:`[ atomtypes ]` section
+to identify elements, and guesses from atom names when atomic numbers are missing.
+Names can be ambiguous: for example, :code:`CA` can refer to a carbon atom or a
+calcium ion. To require explicit atomic numbers, pass
+:code:`allowElementGuessing=False` to :class:`GromacsTopFile`. This raises a
+:class:`ValueError` if an atom in the topology uses a type without an atomic
+number. An explicit atomic number of zero represents a particle with no element,
+such as a dummy particle, and is accepted in either mode.
+
 .. _using-charmm-files:
 
 Using CHARMM Files

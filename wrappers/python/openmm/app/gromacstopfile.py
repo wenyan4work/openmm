@@ -160,12 +160,13 @@ class GromacsTopFile(object):
 
     def _processFile(self, file):
         append = ''
-        for line in open(file):
-            if line.strip().endswith('\\'):
-                append = '%s %s' % (append, line[:line.rfind('\\')])
-            else:
-                self._processLine(append+' '+line, file)
-                append = ''
+        with open(file) as inputFile:
+            for line in inputFile:
+                if line.strip().endswith('\\'):
+                    append = '%s %s' % (append, line[:line.rfind('\\')])
+                else:
+                    self._processLine(append+' '+line, file)
+                    append = ''
 
     def _processLine(self, line, file):
         """Process one line from a file."""
@@ -208,7 +209,7 @@ class GromacsTopFile(object):
                     raise ValueError('Illegal line in .top file: '+line)
                 name = fields[1]
                 valueStart = stripped.find(name, len(command))+len(name)+1
-                value = line[valueStart:].strip()
+                value = stripped[valueStart:].strip()
                 value = value or '1' # Default define is 1
                 self._defines[name] = value
             elif command == '#ifdef':
@@ -218,7 +219,7 @@ class GromacsTopFile(object):
                 name = fields[1]
                 self._ifStack.append(name in self._defines)
                 self._elseStack.append(False)
-            elif command == '#undef':
+            elif command == '#undef' and not ignore:
                 # Un-define a variable
                 if len(fields) < 2:
                     raise ValueError('Illegal line in .top file: '+line)
@@ -325,7 +326,7 @@ class GromacsTopFile(object):
     def _processMoleculeType(self, line):
         """Process a line in the [ moleculetypes ] category."""
         fields = line.split()
-        if len(fields) < 1:
+        if len(fields) < 2:
             raise ValueError('Too few fields in [ moleculetypes ] line: '+line)
         type = GromacsTopFile._MoleculeType(fields[0], int(fields[1]))
         self._moleculeTypes[fields[0]] = type
@@ -435,12 +436,14 @@ class GromacsTopFile(object):
         fields = line.split()
         if len(fields) < 6:
             raise ValueError('Too few fields in [ atomtypes ] line: '+line)
-        if len(fields[3]) == 1:
+        if len(fields[3]) == 1 and fields[3].isalpha():
             # Bonded type and atomic number are both missing.
             fields.insert(1, None)
             fields.insert(1, None)
         elif len(fields[4]) == 1 and fields[4].isalpha():
-            if fields[1][0].isalpha():
+            try:
+                int(fields[1])
+            except ValueError:
                 # Atomic number is missing.
                 fields.insert(2, None)
             else:
@@ -469,6 +472,8 @@ class GromacsTopFile(object):
     def _processDihedralType(self, line):
         """Process a line in the [ dihedraltypes ] category."""
         fields = line.split()
+        if len(fields) < 3:
+            raise ValueError('Too few fields in [ dihedraltypes ] line: '+line)
         if len(fields[2]) == 1 and fields[2].isdigit():
             # The third field contains the function type, meaning only two atom types are specified.
             # Interpret them as the two inner ones.
@@ -513,6 +518,8 @@ class GromacsTopFile(object):
 
     def _processVirtualSites2(self, line):
         """Process a line in the [ virtual_sites2 ] category."""
+        if self._currentMoleculeType is None:
+            raise ValueError('Found [ virtual_sites2 ] section before [ moleculetype ]')
         fields = line.split()
         if len(fields) < 5:
             raise ValueError('Too few fields in [ virtual_sites2 ] line: ' + line)
@@ -522,6 +529,8 @@ class GromacsTopFile(object):
 
     def _processVirtualSites3(self, line):
         """Process a line in the [ virtual_sites3 ] category."""
+        if self._currentMoleculeType is None:
+            raise ValueError('Found [ virtual_sites3 ] section before [ moleculetype ]')
         fields = line.split()
         if len(fields) < 7:
             raise ValueError('Too few fields in [ virtual_sites3 ] line: ' + line)
@@ -529,7 +538,8 @@ class GromacsTopFile(object):
             raise ValueError('Unsupported function type in [ virtual_sites3 ] line: '+line)
         self._currentMoleculeType.vsites3.append(fields)
 
-    def __init__(self, file, periodicBoxVectors=None, unitCellDimensions=None, includeDir=None, defines=None):
+    def __init__(self, file, periodicBoxVectors=None, unitCellDimensions=None, includeDir=None, defines=None,
+                 allowElementGuessing=True):
         """Load a top file.
 
         Parameters
@@ -548,6 +558,13 @@ class GromacsTopFile(object):
             /usr/local, this will resolve to /usr/local/gromacs/share/gromacs/top
         defines : dict={}
             preprocessor definitions that should be predefined when parsing the file
+        allowElementGuessing : bool=True
+            If True, guess elements from atom names when atomic numbers are
+            omitted from [ atomtypes ]. These guesses can be ambiguous or
+            incorrect. If False, raise ValueError when an atom in the topology
+            uses a type without an atomic number. Explicit atomic numbers always
+            take precedence over names; zero denotes a particle with no element.
+            Invalid atomic numbers raise ValueError in either mode.
          """
         if includeDir is None:
             includeDir = _defaultGromacsIncludeDir()
@@ -623,8 +640,14 @@ class GromacsTopFile(object):
 
                     # Try to determine the element.
 
+                    if fields[1] not in self._atomTypes:
+                        raise ValueError('Unknown atom type: '+fields[1])
                     atomicNumber = self._atomTypes[fields[1]][2]
                     if atomicNumber is None:
+                        if not allowElementGuessing:
+                            raise ValueError('Missing atomic number for atom type %s (atom %s); '
+                                             'specify it in [ atomtypes ] or set allowElementGuessing=True'
+                                             % (fields[1], atomName))
                         # Try to guess the element from the name.
                         upper = atomName.upper()
                         if upper.startswith('CL'):
@@ -638,10 +661,13 @@ class GromacsTopFile(object):
                                 element = elem.get_by_symbol(atomName[0])
                             except KeyError:
                                 element = None
-                    elif atomicNumber == '0':
-                        element = None
                     else:
-                        element = elem.Element.getByAtomicNumber(int(atomicNumber))
+                        try:
+                            number = int(atomicNumber)
+                            element = None if number == 0 else elem.Element.getByAtomicNumber(number)
+                        except (ValueError, KeyError):
+                            raise ValueError('Invalid atomic number %s for atom type %s (atom %s)'
+                                             % (atomicNumber, fields[1], atomName)) from None
                     atoms.append(top.addAtom(atomName, element, r))
 
                 # Add bonds to the topology
